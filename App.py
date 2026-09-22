@@ -132,6 +132,10 @@ class App(QApplication):
     def quit_app(self):
         self.tray.hide()
         self.save_now()
+        try:
+            self.win.shutdown()      # 停掉后台网络线程，避免退出时线程仍在运行
+        except Exception:
+            pass
         keyboard.unhook_all_hotkeys()
         sys.exit(0)
 

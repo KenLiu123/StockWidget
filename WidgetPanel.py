@@ -1,14 +1,50 @@
 import requests, keyboard
 from functools import partial
 
-from PySide6.QtCore import Qt, QEvent, QTimer, Signal
+from PySide6.QtCore import Qt, QEvent, QTimer, Signal, QObject, QThread, Slot
 from PySide6.QtGui import QFont, QAction, QColor
 from PySide6.QtWidgets import QApplication, QWidget, QMenu, QVBoxLayout, QLabel, QTableView, QHeaderView, QAbstractItemView, QFrame, QStyledItemDelegate
 
 from Display import SimpleTableModel, KLineDelegate
 
+
+class PriceWorker(QObject):
+    """
+    在后台线程里做网络请求和解析。
+
+    新浪接口的 DNS 解析不受 requests 的 timeout 约束，网络差时一次解析
+    可能要 5~12 秒；放在主线程会直接冻结整个界面。
+    """
+    done = Signal(object, object)
+    failed = Signal(object)
+
+    def __init__(self, panel):
+        super().__init__()
+        self._panel = panel
+        self._session = None
+
+    def _get_session(self):
+        # 复用连接，避免每 2 秒重做一次 TCP + TLS 握手
+        if self._session is None:
+            s = requests.Session()
+            s.headers.update({'User-Agent': 'Mozilla/5.0'})
+            s.mount('https://', requests.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=4))
+            self._session = s
+        return self._session
+
+    @Slot(list)
+    def fetch(self, codes):
+        try:
+            rows, signs = self._panel._get_price(list(codes), session=self._get_session())
+        except Exception as e:
+            self.failed.emit(e)
+            return
+        self.done.emit(rows, signs)
+
+
 class FloatLabel(QWidget):
     hotkey_triggered = Signal()
+    _refresh_requested = Signal(list)
     def __init__(self, cfg: dict):
         super().__init__()
         self._on_change = (lambda: None)
@@ -35,6 +71,16 @@ class FloatLabel(QWidget):
         
         # 防止买一/卖一同步时触发重复处理
         self._syncing_b1s1 = False
+
+        # --- 性能相关状态 ---
+        self._style_sig = None      # 已应用的样式表输入签名（避免重复 setStyleSheet）
+        self._fit_sig = None        # 已应用的尺寸签名（避免每次刷新都重算列宽/窗口大小）
+        self._net_busy = False      # 后台请求进行中
+        self._style_timer = None
+        self._fit_timer = None
+        self._refresh_timer = None
+        self._net_thread = None
+        self._worker = None
 
         self.header_visible     = bool(cfg.get("header_visible", False))    # 表头可见
         self.grid_visible       = bool(cfg.get("grid_visible", False))      # 网格可见
@@ -136,9 +182,28 @@ class FloatLabel(QWidget):
         for w in (self.panel, self.table, self.table.viewport(), self.table.horizontalHeader(), self.table.verticalHeader()):
             w.installEventFilter(self)
 
-        self.apply_style()
+        # 样式表重建去抖：setStyleSheet 会重新 polish 整棵控件树（实测约 200ms），
+        # 拖动滑块时不能每一步都重建。
+        self._style_timer = QTimer(self)
+        self._style_timer.setSingleShot(True)
+        self._style_timer.setInterval(80)
+        self._style_timer.timeout.connect(self._apply_stylesheet_now)
+
+        # 尺寸自适应去抖：合并同一轮事件内的多次请求，避免重复全量重排
+        self._fit_timer = QTimer(self)
+        self._fit_timer.setSingleShot(True)
+        self._fit_timer.setInterval(0)
+        self._fit_timer.timeout.connect(self._run_fit)
+
+        # 数据刷新合并：设置面板里连续改设置只发一次请求
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(40)
+        self._refresh_timer.timeout.connect(self._refresh_from_function)
+
+        self._apply_style_now()
         self.set_window_opacity_percent(self.opacity_pct)
-        self._fit_to_contents()
+        self._fit_to_contents(force=True)
 
         scr = QApplication.primaryScreen().availableGeometry()
         pos = cfg.get("pos")
@@ -152,11 +217,20 @@ class FloatLabel(QWidget):
 
         self._drag_pos = None
 
+        # 网络请求放到独立线程，DNS/接口变慢时界面依然可操作
+        self._net_thread = QThread(self)
+        self._worker = PriceWorker(self)
+        self._worker.moveToThread(self._net_thread)
+        self._refresh_requested.connect(self._worker.fetch)
+        self._worker.done.connect(self._on_prices)
+        self._worker.failed.connect(self._on_prices_failed)
+        self._net_thread.start()
+
         self.timer = QTimer(self)
         self.timer.setInterval(max(1, self.refresh_seconds)*1000)
         self.timer.timeout.connect(self._refresh_from_function)
         self.timer.start()
-        self._refresh_from_function()
+        self._request_refresh()
         self._defer_fit()
 
         self._keep_top_timer = QTimer(self)
@@ -246,7 +320,47 @@ class FloatLabel(QWidget):
         return False
 
     # ----- 外观/尺寸 -----
+    def _style_signature(self):
+        """所有会影响样式表内容的输入。只有它变化时才值得重建样式表。"""
+        return (
+            self.bg.getRgb(),
+            self.fg.name(),
+            bool(self.grid_visible),
+            bool(self.default_color),
+        )
+
     def apply_style(self):
+        """
+        请求刷新外观。
+
+        样式表重建很贵（setStyleSheet 会重新 polish 整棵控件树），因此：
+          * 输入没变（例如只改字号/行距）就完全跳过样式表，只更新字体和尺寸；
+          * 输入变了（颜色/网格）也去抖，拖动滑块只在停下来后重建一次。
+        """
+        sig = self._style_signature()
+        if sig != self._style_sig:
+            self._style_sig = sig
+            if self._style_timer is not None:
+                self._style_timer.start()
+            else:
+                self._apply_stylesheet_now()
+        else:
+            self._apply_fonts()
+            self._defer_fit()
+
+    def _apply_style_now(self):
+        """立即应用样式（仅初始化时使用，避免首帧没有样式）。"""
+        self._style_sig = self._style_signature()
+        self._apply_stylesheet_now()
+
+    def _apply_fonts(self):
+        self.table.setFont(self.font)
+        self.table.horizontalHeader().setFont(self.font)
+
+    def _apply_stylesheet_now(self):
+        """真正重建样式表（贵），顺带同步字体并请求一次尺寸重算。"""
+        if not hasattr(self, 'panel'):
+            return
         r,g,b,a = self.bg.red(), self.bg.green(), self.bg.blue(), self.bg.alpha()
         fg_r, fg_g, fg_b = self.fg.red(), self.fg.green(), self.fg.blue()
         line_col = f"rgba({fg_r},{fg_g},{fg_b},80)"
@@ -278,8 +392,7 @@ class FloatLabel(QWidget):
                 padding: 2px 4px;
             }}
         """)
-        self.table.setFont(self.font)
-        self.table.horizontalHeader().setFont(self.font)
+        self._apply_fonts()
         self._defer_fit()
 
     def _apply_row_heights(self):
@@ -289,7 +402,46 @@ class FloatLabel(QWidget):
         for r in range(self.model.rowCount()):
             self.table.setRowHeight(r, h)
 
-    def _fit_to_contents(self):
+    def _fit_signature(self):
+        """决定表格尺寸的全部输入。"""
+        return (
+            tuple(self.model.headers()),
+            self.model.rowCount(),
+            self._column_width_signature(),
+            int(getattr(self, 'line_extra_px', 0)),
+            self.font.family(),
+            self.font.pointSize(),
+            bool(self.header_visible),
+            bool(self.grid_visible),
+        )
+
+    def _column_width_signature(self):
+        """
+        每列最宽单元格的实际像素宽度。用它判断列宽是否需要重算，
+        比"文本长度"准确（不同字符宽度不同），且只有几十次测量。
+        """
+        fm = self.table.fontMetrics()
+        rows = self.model.rowCount()
+        sig = []
+        for c in range(self.model.columnCount()):
+            widest = 0
+            for r in range(rows):
+                text = self.model.cell_text(r, c)
+                if text:
+                    w = fm.horizontalAdvance(text)
+                    if w > widest:
+                        widest = w
+            sig.append(widest)
+        return tuple(sig)
+
+    def _fit_to_contents(self, force: bool = False):
+        # 数据内容/字体/列设置都没变时，没必要重算列宽并 resize 窗口
+        # （半透明窗口每次 resize 都要整体重绘一次）
+        sig = self._fit_signature()
+        if not force and sig == self._fit_sig:
+            return
+        self._fit_sig = sig
+
         self.table.horizontalHeader().setStretchLastSection(False)
         self.table.resizeColumnsToContents()
         self._apply_row_heights()
@@ -307,8 +459,17 @@ class FloatLabel(QWidget):
         self.panel.adjustSize()
         self.resize(self.panel.size())
 
-    def _defer_fit(self):
-        QTimer.singleShot(0, self._fit_to_contents)
+    def _run_fit(self):
+        self._fit_to_contents()
+
+    def _defer_fit(self, force: bool = False):
+        if force:
+            self._fit_sig = None
+        t = getattr(self, '_fit_timer', None)
+        if t is not None:
+            t.start()          # 多次调用会合并成一次
+        else:
+            QTimer.singleShot(0, self._run_fit)
 
     # ----- 数据 & 投影 -----
     def _show_error(self, msg: str):
@@ -343,7 +504,7 @@ class FloatLabel(QWidget):
                 pass
 
     # ----- 数据来源：新浪财经 -----
-    def _get_price(self, codes:list):
+    def _get_price(self, codes:list, session=None):
         label = ",".join([str(c).strip() for c in codes if str(c).strip()])
         if not label:
             raise Exception("暂无数据，请添加自选")
@@ -352,7 +513,9 @@ class FloatLabel(QWidget):
         sign_data = []
         url = 'https://hq.sinajs.cn/list=' + label
         headers = {'Referer': 'https://finance.sina.com.cn', 'User-Agent': 'Mozilla/5.0'}
-        r = requests.get(url, headers=headers, timeout=3)
+        # session 由后台线程持有；没有传入时退回模块级 requests（同步）
+        http = session if session is not None else requests
+        r = http.get(url, headers=headers, timeout=3)
         r.encoding = 'gbk'
         for line in r.text.split('\n'):
             if not line or '"' not in line:
@@ -572,25 +735,55 @@ class FloatLabel(QWidget):
 
         self._fit_to_contents()
 
+    def _request_refresh(self):
+        """
+        请求一次数据刷新。40ms 内的多次请求合并成一次 —— 设置面板里改一个
+        代码会连续调用 set_codes/set_costs/set_checked_codes，原来一次点击
+        就发 3 次网络请求。
+        """
+        t = getattr(self, '_refresh_timer', None)
+        if t is not None:
+            t.start()
+        else:
+            self._refresh_from_function()
+
     def _refresh_from_function(self):
-        try:
-            full_rows, sign = self._get_price(self.checked_codes)
-        except Exception as e:
+        """发起一次后台刷新（不阻塞界面）。"""
+        codes = list(self.checked_codes)
+        if not codes:
+            self._show_error("暂无数据，请添加自选")
+            return
+        if self._net_busy:
+            return          # 上一次还没回来，跳过这一拍，避免请求堆积
+
+        if self._worker is None or self._net_thread is None:
+            # 兜底：没有后台线程时退回同步执行
             try:
-                import requests as _req
-                if isinstance(e, _req.exceptions.RequestException):
-                    self._show_error(_req.exceptions.RequestException())
-                else:
-                    self._show_error(str(e))
-            except Exception:
-                self._show_error(str(e))
+                full_rows, sign = self._get_price(codes)
+            except Exception as e:
+                self._show_error(e)
+                return
+            self._on_prices(full_rows, sign)
             return
 
+        self._net_busy = True
+        self._refresh_requested.emit(codes)
+
+    def _on_prices(self, full_rows, sign_data):
+        """后台线程返回数据（在主线程执行）。"""
+        self._net_busy = False
         try:
             self._clear_error()
         except Exception:
             pass
-        self._project_columns(full_rows, sign)
+        try:
+            self._project_columns(full_rows, sign_data)
+        except Exception as e:
+            self._show_error(e)
+
+    def _on_prices_failed(self, err):
+        self._net_busy = False
+        self._show_error(err)
 
     # ----- 应用设置 -----
     def set_codes(self, codes_list):
@@ -605,7 +798,7 @@ class FloatLabel(QWidget):
             new = ["sh000001"]
         self.codes = new
         self._notify_change()
-        self._refresh_from_function()
+        self._request_refresh()
 
     def set_checked_codes(self, codes_list):
         seen = set()
@@ -619,12 +812,12 @@ class FloatLabel(QWidget):
             new = ["sh000001"]
         self.checked_codes = new
         self._notify_change()
-        self._refresh_from_function()
+        self._request_refresh()
 
     def set_costs(self, costs_dict):
         self.costs = costs_dict.copy()
         self._notify_change()
-        self._refresh_from_function()
+        self._request_refresh()
 
     def set_flag(self, idx, checked: bool):
         """设置指标显示标志。idx 可以是整数索引（向后兼容）或列标题字符串"""
@@ -676,18 +869,18 @@ class FloatLabel(QWidget):
             if prev == checked:
                 return
         self._notify_change()
-        self._refresh_from_function()
+        self._request_refresh()
 
     def set_code_type(self, pure_num: bool):
         self.short_code = bool(pure_num)
         self._notify_change()
-        self._refresh_from_function()
+        self._request_refresh()
 
     def set_name_length(self, name_len: int):
         if name_len >=0:
             self.name_length = name_len
             self._notify_change()
-            self._refresh_from_function()
+            self._request_refresh()
 
     def set_b1s1_display(self, mode: str):
         """mode: 'qty' | 'price' | 'both'"""
@@ -695,7 +888,7 @@ class FloatLabel(QWidget):
             return
         self.b1s1_display = mode
         self._notify_change()
-        self._refresh_from_function()
+        self._request_refresh()
 
     def set_header_visible(self, vis: bool):
         self.header_visible = bool(vis)
@@ -823,8 +1016,9 @@ class FloatLabel(QWidget):
 
     def mouseMoveEvent(self, e):
         if getattr(self, "_drag_pos", None) and (e.buttons() & Qt.LeftButton):
+            # 拖动时不再每个 mouse-move 都 raise_()（置顶由按下/松开和
+            # _keep_top_timer 负责），省下每帧一次窗口 z 序切换
             self.move(e.globalPosition().toPoint() - self._drag_pos)
-            self._ensure_on_top()
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.LeftButton:
@@ -858,6 +1052,28 @@ class FloatLabel(QWidget):
     def closeEvent(self, event): 
         event.ignore()
         self.hide()
+
+    def shutdown(self):
+        """停止定时器并结束后台线程（退出前调用，避免 Qt 在线程仍在运行时析构）。"""
+        for t in (getattr(self, 'timer', None), getattr(self, '_keep_top_timer', None),
+                  getattr(self, '_refresh_timer', None), getattr(self, '_style_timer', None),
+                  getattr(self, '_fit_timer', None)):
+            try:
+                if t is not None and t.isActive():
+                    t.stop()
+            except Exception:
+                pass
+        th = getattr(self, '_net_thread', None)
+        if th is not None:
+            try:
+                if th.isRunning():
+                    th.quit()
+                    if not th.wait(2000):
+                        # 卡在 DNS/网络上时直接终止，否则退出会触发 Qt 断言
+                        th.terminate()
+                        th.wait(500)
+            except Exception:
+                pass
 
     def showEvent(self, event):
         super().showEvent(event)

@@ -85,14 +85,51 @@ class SimpleTableModel(QAbstractTableModel):
         return None
 
     def set_rows_headers(self, rows, headers, meta=None):
+        """
+        更新数据。若表格形状（列头 + 行列数）未变，只发 dataChanged，
+        避免整表 reset —— reset 会让视图丢弃全部缓存并重算行高列宽，
+        而本程序每 2 秒刷新一次，代价很高。
+        """
+        rows = rows or []
+        headers = headers or []
+        meta = list(meta or [{} for _ in rows])
+
+        same_shape = (
+            headers == self._headers
+            and len(rows) == len(self._rows)
+            and (not rows or len(rows[0]) == (len(self._rows[0]) if self._rows else 0))
+        )
+        if same_shape:
+            self._rows = rows
+            self._row_meta = meta
+            if rows and rows[0]:
+                top = self.index(0, 0)
+                bottom = self.index(len(rows) - 1, len(rows[0]) - 1)
+                self.dataChanged.emit(
+                    top, bottom,
+                    [Qt.DisplayRole, Qt.ForegroundRole, Qt.UserRole, Qt.TextAlignmentRole],
+                )
+            return
+
         self.beginResetModel()
-        self._rows = rows or []
-        self._headers = headers or []
-        self._row_meta = list(meta or [{} for _ in self._rows])
+        self._rows = rows
+        self._headers = headers
+        self._row_meta = meta
         self.endResetModel()
 
     def set_align_right_cols(self, cols_idx):
         self._align_right = set(cols_idx or [])
+
+    def headers(self):
+        return list(self._headers)
+
+    def cell_text(self, row, col):
+        """单元格的显示文本；K线等非文本单元格返回空串。"""
+        if not (0 <= row < len(self._rows)):
+            return ""
+        r = self._rows[row]
+        cell = r[col] if 0 <= col < len(r) else ""
+        return "" if isinstance(cell, dict) else str(cell)
 
 
 class KLineDelegate(QStyledItemDelegate):
