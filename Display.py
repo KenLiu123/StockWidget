@@ -64,6 +64,10 @@ class SimpleTableModel(QAbstractTableModel):
                 sign = int(meta.get("b1", 0))
             elif header == "卖一":
                 sign = int(meta.get("s1", 0))
+            elif header == "收益":
+                sign = int(meta.get("profit", 0))
+            elif header == "成本":
+                sign = int(meta.get("profit", 0))
             else:
                 return self.fg_color
 

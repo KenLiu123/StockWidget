@@ -52,8 +52,12 @@ class FloatLabel(QWidget):
 
         # 设置初值
         self.codes = [str(c).strip() for c in codes_cfg if str(c).strip()]
+        # 成本和收益数据
+        self.costs = cfg.get("costs", {})
+        self.profits = {}
+        
         # 列标题列表（提前定义，供后续旧配置解析使用）
-        self.ALL_HEADERS = ["代码", "名称", "现价", "涨跌值", "涨跌幅", "买一", "卖一", "委比", "成交量", "成交额", "均价", "K线"]
+        self.ALL_HEADERS = ["代码", "名称", "现价", "涨跌值", "涨跌幅", "买一", "卖一", "委比", "成交量", "成交额", "均价", "K线", "成本", "收益"]
 
         # 列显示标志（独立属性）
         # 解析旧 flags 配置以做回退
@@ -78,6 +82,8 @@ class FloatLabel(QWidget):
         self.amount_visible = bool(cfg.get("amount_visible", old_flags.get("成交额", False)))
         self.avg_visible = bool(cfg.get("avg_visible", old_flags.get("均价", False)))
         self.kline_visible = bool(cfg.get("kline_visible", old_flags.get("K线", False)))
+        self.cost_visible = bool(cfg.get("cost_visible", old_flags.get("成本", False)))
+        self.profit_visible = bool(cfg.get("profit_visible", old_flags.get("收益", False)))
 
         # 设置自选显示股票（新名 checked_codes）
         self.codes = [str(c).strip() for c in codes_cfg if str(c).strip()]
@@ -184,6 +190,8 @@ class FloatLabel(QWidget):
             "amount_visible": bool(getattr(self, 'amount_visible', False)),
             "avg_visible": bool(getattr(self, 'avg_visible', False)),
             "kline_visible": bool(getattr(self, 'kline_visible', False)),
+            "cost_visible": bool(getattr(self, 'cost_visible', False)),
+            "profit_visible": bool(getattr(self, 'profit_visible', False)),
             "short_code": self.short_code,
             "name_length": self.name_length,
             "b1s1_price": (getattr(self, 'b1s1_display', 'qty') == 'price'),
@@ -201,6 +209,7 @@ class FloatLabel(QWidget):
             "pos": {"x": self.x(), "y": self.y()},
             "hotkey": self.hotkey,
             "start_on_boot": bool(self.start_on_boot),
+            "costs": self.costs,
         }
 
     def header_is_visible(self, header: str) -> bool:
@@ -228,6 +237,10 @@ class FloatLabel(QWidget):
                 return bool(getattr(self, 'avg_visible', False))
             if header == "K线":
                 return bool(getattr(self, 'kline_visible', False))
+            if header == "成本":
+                return bool(getattr(self, 'cost_visible', False))
+            if header == "收益":
+                return bool(getattr(self, 'profit_visible', False))
         except Exception:
             pass
         return False
@@ -476,7 +489,15 @@ class FloatLabel(QWidget):
 
             k_payload = {"k": (opening_price, current_price, high_price, low_price, prev_close)}
 
-            # "代码", "名称", "现价", "涨跌值", "涨跌幅", "买一", "卖一", "委比", "成交量", "成交额", "均价",  "K线"
+            # 计算收益（百分比）
+            cost = self.costs.get(code, 0.0)
+            if cost > 0:
+                profit_pct = (current_price - cost) / cost * 100
+                profit_str = f"{profit_pct:+.2f}%"
+            else:
+                profit_str = "-"
+            
+            # "代码", "名称", "现价", "涨跌值", "涨跌幅", "买一", "卖一", "委比", "成交量", "成交额", "均价",  "K线", "成本", "收益"
             if code[2] not in ('1','5'):
                 price_data.append([
                     code[2:] if self.short_code else code,
@@ -490,7 +511,9 @@ class FloatLabel(QWidget):
                     f"{deals_vol}" if deals_vol<1e4 else (f"{deals_vol/1e4:.2f}万" if deals_vol<1e8 else f"{deals_vol/1e8:.2f}亿"),
                     f"{deals_amt/1e4:.2f}万" if deals_amt<1e8 else (f"{deals_amt/1e8:.2f}亿" if deals_amt<1e12 else f"{deals_amt/1e12:.2f}万亿"),
                     f"{avg:.2f}",
-                    k_payload
+                    k_payload,
+                    f"{cost:.2f}" if cost > 0 else "-",
+                    profit_str
                 ])
             else:
                 price_data.append([
@@ -505,7 +528,9 @@ class FloatLabel(QWidget):
                     f"{deals_vol}" if deals_vol<1e4 else (f"{deals_vol/1e4:.2f}万" if deals_vol<1e8 else f"{deals_vol/1e8:.2f}亿"),
                     f"{deals_amt/1e4:.2f}万" if deals_amt<1e8 else (f"{deals_amt/1e8:.2f}亿" if deals_amt<1e12 else f"{deals_amt/1e12:.2f}万亿"),
                     f"{avg:.3f}",
-                    k_payload
+                    k_payload,
+                    f"{cost:.3f}" if cost > 0 else "-",
+                    profit_str
                 ])
             sign_data.append({
                 "delta": (change > 0) - (change < 0), 
@@ -513,6 +538,7 @@ class FloatLabel(QWidget):
                 "avg": (avg > prev_close) - (avg < prev_close),
                 "b1": b1_color_sign,
                 "s1": s1_color_sign,
+                "profit": (profit_pct > 0) - (profit_pct < 0) if cost > 0 else 0
             })
         
         return price_data, sign_data
@@ -527,8 +553,8 @@ class FloatLabel(QWidget):
             proj_rows.append([row[i] for i in cols])
             proj_meta.append(sign_data[r])
 
-        # 右对齐：除了名称、K线、卖一外的所有列都右对齐
-        right_cols = [i for i, h in enumerate(headers) if h not in ("名称", "K线", "卖一")]
+        # 右对齐：除了名称、K线、卖一、收益外的所有列都右对齐
+        right_cols = [i for i, h in enumerate(headers) if h not in ("名称", "K线", "卖一", "收益")]
         self.model.set_align_right_cols(right_cols)
         self.model.set_rows_headers(proj_rows, headers, meta=proj_meta)
         self.model.set_color_scheme(self.default_color, self.fg)
@@ -595,6 +621,11 @@ class FloatLabel(QWidget):
         self._notify_change()
         self._refresh_from_function()
 
+    def set_costs(self, costs_dict):
+        self.costs = costs_dict.copy()
+        self._notify_change()
+        self._refresh_from_function()
+
     def set_flag(self, idx, checked: bool):
         """设置指标显示标志。idx 可以是整数索引（向后兼容）或列标题字符串"""
         # 兼容老版本：若传整数索引，转为列标题
@@ -633,6 +664,10 @@ class FloatLabel(QWidget):
                 prev = bool(getattr(self, 'avg_visible', False)); self.avg_visible = checked
             elif header == "K线":
                 prev = bool(getattr(self, 'kline_visible', False)); self.kline_visible = checked
+            elif header == "成本":
+                prev = bool(getattr(self, 'cost_visible', False)); self.cost_visible = checked
+            elif header == "收益":
+                prev = bool(getattr(self, 'profit_visible', False)); self.profit_visible = checked
         except Exception:
             prev = None
 

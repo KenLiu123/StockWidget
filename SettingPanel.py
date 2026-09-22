@@ -1,12 +1,13 @@
 import os, re
 from functools import partial
 
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtCore import Qt, QSize, QItemSelectionModel
 from PySide6.QtGui import QColor, QFontDatabase, QKeySequence
 from PySide6.QtWidgets import (
     QWidget, QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QTabWidget, QPushButton, QSlider,
     QGroupBox, QLabel, QColorDialog, QComboBox, QAbstractItemView,
-    QCheckBox, QListWidget, QListWidgetItem, QKeySequenceEdit, QFileDialog
+    QCheckBox, QListWidget, QListWidgetItem, QKeySequenceEdit, QFileDialog,
+    QTableWidget, QTableWidgetItem, QLineEdit, QHeaderView
 )
 from WidgetPanel import FloatLabel
 
@@ -25,7 +26,7 @@ class SettingsDialog(QDialog):
         main.addWidget(self.tabs)
 
         self.tab_sizes = {
-            0: QSize(300, 300),
+            0: QSize(400, 350),
             1: QSize(440, 420),
             2: QSize(360, 350),
             3: QSize(300, 220),
@@ -41,16 +42,34 @@ class SettingsDialog(QDialog):
         g_codes.setContentsMargins(3,12,3,6)
         lay_codes = QHBoxLayout(g_codes)
         lay_codes.setSpacing(6)
-        # 1.1 代码列表
-        self.list_codes = QListWidget()
-        self.list_codes.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked | QAbstractItemView.EditKeyPressed)
-        self.list_codes.setFixedWidth(150)
-        for c in self.win.codes:
-            it = QListWidgetItem(c)
-            it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable | Qt.ItemIsSelectable | Qt.ItemIsEnabled)
-            it.setCheckState(Qt.Checked if c in getattr(self.win, 'checked_codes', []) else Qt.Unchecked)
-            it.setData(Qt.UserRole, c)  # 记住上次有效值
-            self.list_codes.addItem(it)
+        # 1.1 代码列表（改为表格）
+        self.table_codes = QTableWidget()
+        self.table_codes.setColumnCount(2)
+        self.table_codes.setHorizontalHeaderLabels(["代码", "成本"])
+        self.table_codes.horizontalHeader().setStretchLastSection(True)
+        self.table_codes.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table_codes.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table_codes.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table_codes.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table_codes.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked | QAbstractItemView.EditKeyPressed)
+        self.table_codes.setFixedHeight(200)
+        
+        # 填充数据
+        for i, c in enumerate(self.win.codes):
+            self.table_codes.insertRow(i)
+            # 代码列
+            item_code = QTableWidgetItem(c)
+            item_code.setFlags(item_code.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable | Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            item_code.setCheckState(Qt.Checked if c in getattr(self.win, 'checked_codes', []) else Qt.Unchecked)
+            item_code.setData(Qt.UserRole, c)  # 记住上次有效值
+            self.table_codes.setItem(i, 0, item_code)
+            
+            # 成本列
+            cost_val = self.win.costs.get(c, "")
+            item_cost = QTableWidgetItem(str(cost_val) if cost_val else "")
+            item_cost.setFlags(item_cost.flags() | Qt.ItemIsEditable | Qt.ItemIsSelectable)
+            self.table_codes.setItem(i, 1, item_cost)
+        
         # 1.2 操作按钮
         btn_col = QVBoxLayout()
         btn_col.setSpacing(4)
@@ -66,7 +85,7 @@ class SettingsDialog(QDialog):
             btn_col.addWidget(b)
         btn_col.addStretch(1)
 
-        lay_codes.addWidget(self.list_codes, 1)
+        lay_codes.addWidget(self.table_codes, 1)
         lay_codes.addLayout(btn_col)
         code_settings.addWidget(g_codes)
 
@@ -183,12 +202,27 @@ class SettingsDialog(QDialog):
         gl_flag_other = QGridLayout(g_flag_other)
         gl_flag_other.setHorizontalSpacing(6)
         gl_flag_other.setVerticalSpacing(6)
+        # 原有的K线复选框
         for i in range(11,12):
             cb = QCheckBox(cb_texts[i])
             cb.setChecked(self.win.header_is_visible(cb_texts[i]))
             cb.stateChanged.connect(partial(self._on_cb_changed, cb_texts[i]))
             self.cbs.append(cb)
             gl_flag_other.addWidget(cb, i-11, 0)
+        
+        # 新增：成本和收益复选框
+        self.cb_cost = QCheckBox("成本")
+        self.cb_cost.setChecked(self.win.cost_visible)
+        self.cb_cost.stateChanged.connect(partial(self._on_cb_changed, "成本"))
+        self.cbs.append(self.cb_cost)
+        gl_flag_other.addWidget(self.cb_cost, 1, 0)
+        
+        self.cb_profit = QCheckBox("收益")
+        self.cb_profit.setChecked(self.win.profit_visible)
+        self.cb_profit.stateChanged.connect(partial(self._on_cb_changed, "收益"))
+        self.cbs.append(self.cb_profit)
+        gl_flag_other.addWidget(self.cb_profit, 2, 0)
+        
         gl_flags.addWidget(g_flag_other, 2, 0)
 
         data_settings.addWidget(g_flags)
@@ -338,7 +372,7 @@ class SettingsDialog(QDialog):
 
         # ---- 连接 ----
         # 连接：代码列表
-        self.list_codes.itemChanged.connect(self._on_codes_changed)
+        self.table_codes.itemChanged.connect(self._on_codes_changed)
         self.btn_add.clicked.connect(self._add_code)
         self.btn_del.clicked.connect(self._del_code)
         self.btn_up.clicked.connect(self._move_up)
@@ -410,77 +444,113 @@ class SettingsDialog(QDialog):
                 return 'bj' + s
         return None
 
-    def _collect_codes_from_list(self):
+    def _collect_codes_from_table(self):
         codes = []
+        costs = {}
         seen = set()
-        for i in range(self.list_codes.count()):
-            txt = self.list_codes.item(i).text()
+        for i in range(self.table_codes.rowCount()):
+            txt = self.table_codes.item(i, 0).text()
             norm = self._normalize_code_or_none(txt)
             if norm:
                 if norm not in seen:
                     seen.add(norm)
                     codes.append(norm)
                 # 写回规范化文本
-                it = self.list_codes.item(i)
+                it = self.table_codes.item(i, 0)
                 if it.text() != norm:
-                    self.list_codes.blockSignals(True)
+                    self.table_codes.blockSignals(True)
                     it.setText(norm)
                     it.setData(Qt.UserRole, norm)
-                    self.list_codes.blockSignals(False)
+                    self.table_codes.blockSignals(False)
+                
+                # 获取成本
+                cost_item = self.table_codes.item(i, 1)
+                cost_val = cost_item.text().strip()
+                if cost_val:
+                    try:
+                        costs[norm] = float(cost_val)
+                    except ValueError:
+                        costs[norm] = 0.0
+                else:
+                    costs[norm] = 0.0
             else:
                 # 回退到上次有效值
-                it = self.list_codes.item(i)
+                it = self.table_codes.item(i, 0)
                 prev = it.data(Qt.UserRole)
                 if prev:
-                    self.list_codes.blockSignals(True)
+                    self.table_codes.blockSignals(True)
                     it.setText(prev)
-                    self.list_codes.blockSignals(False)
+                    self.table_codes.blockSignals(False)
                 else:
                     # 没有上次有效值则删除
-                    self.list_codes.takeItem(i)
-                    return self._collect_codes_from_list()
-        return codes
+                    self.table_codes.removeRow(i)
+                    return self._collect_codes_from_table()
+        return codes, costs
 
-    def _on_codes_changed(self, _item):
-        codes = self._collect_codes_from_list()
+    def _on_codes_changed(self, item):
+        codes, costs = self._collect_codes_from_table()
         self.win.set_codes(codes)
+        self.win.set_costs(costs)
         checked_codes = [
-            self.list_codes.item(i).text().split()[0]
-            for i in range(self.list_codes.count())
-            if self.list_codes.item(i).checkState() == Qt.Checked
+            self.table_codes.item(i, 0).text()
+            for i in range(self.table_codes.rowCount())
+            if self.table_codes.item(i, 0).checkState() == Qt.Checked
         ]
         self.win.set_checked_codes(checked_codes)
 
     def _add_code(self):
-        it = QListWidgetItem("sh000001")
+        row_count = self.table_codes.rowCount()
+        self.table_codes.insertRow(row_count)
+        # 代码列
+        it = QTableWidgetItem("sh000001")
         it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable | Qt.ItemIsSelectable | Qt.ItemIsEnabled)
         it.setCheckState(Qt.Unchecked)
         it.setData(Qt.UserRole, "sh000001")
-        self.list_codes.addItem(it)
-        self.list_codes.setCurrentItem(it)
-        self.list_codes.editItem(it)
-        self._on_codes_changed(it)
+        self.table_codes.setItem(row_count, 0, it)
+        # 成本列
+        cost_item = QTableWidgetItem("")
+        cost_item.setFlags(cost_item.flags() | Qt.ItemIsEditable | Qt.ItemIsSelectable)
+        self.table_codes.setItem(row_count, 1, cost_item)
+        self.table_codes.setCurrentCell(row_count, 0)
+        self.table_codes.editItem(it)
+        self._on_codes_changed(None)
 
     def _del_code(self):
-        row = self.list_codes.currentRow()
+        row = self.table_codes.currentRow()
         if row >= 0:
-            self.list_codes.takeItem(row)
+            self.table_codes.removeRow(row)
             self._on_codes_changed(None)
 
     def _move_up(self):
-        row = self.list_codes.currentRow()
+        row = self.table_codes.currentRow()
         if row > 0:
-            it = self.list_codes.takeItem(row)
-            self.list_codes.insertItem(row-1, it)
-            self.list_codes.setCurrentRow(row-1)
+            # 交换行
+            row_data = []
+            for col in range(self.table_codes.columnCount()):
+                item = self.table_codes.takeItem(row, col)
+                row_data.append(item)
+            for col in range(self.table_codes.columnCount()):
+                item = self.table_codes.takeItem(row-1, col)
+                self.table_codes.setItem(row, col, item)
+            for col in range(self.table_codes.columnCount()):
+                self.table_codes.setItem(row-1, col, row_data[col])
+            self.table_codes.setCurrentCell(row-1, 0)
             self._on_codes_changed(None)
 
     def _move_down(self):
-        row = self.list_codes.currentRow()
-        if 0 <= row < self.list_codes.count()-1:
-            it = self.list_codes.takeItem(row)
-            self.list_codes.insertItem(row+1, it)
-            self.list_codes.setCurrentRow(row+1)
+        row = self.table_codes.currentRow()
+        if 0 <= row < self.table_codes.rowCount()-1:
+            # 交换行
+            row_data = []
+            for col in range(self.table_codes.columnCount()):
+                item = self.table_codes.takeItem(row, col)
+                row_data.append(item)
+            for col in range(self.table_codes.columnCount()):
+                item = self.table_codes.takeItem(row+1, col)
+                self.table_codes.setItem(row, col, item)
+            for col in range(self.table_codes.columnCount()):
+                self.table_codes.setItem(row+1, col, row_data[col])
+            self.table_codes.setCurrentCell(row+1, 0)
             self._on_codes_changed(None)
 
     # —— 其它槽 —— #
